@@ -727,8 +727,20 @@ pub struct RecordArgs {
     /// Require authentication for remote API access. When enabled, non-localhost
     /// requests must include Authorization: Bearer <SCREENPIPE_API_KEY>.
     /// Localhost requests are always allowed.
-    #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
+    #[arg(
+        long,
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        conflicts_with = "no_api_auth"
+    )]
     pub api_auth: bool,
+
+    /// Disable API authentication for loopback-only use. Unsafe with
+    /// `--listen-on-lan`; LAN binding still forces authentication on.
+    #[arg(long, default_value_t = false, conflicts_with = "api_auth")]
+    pub no_api_auth: bool,
 
     /// Bind the HTTP server to 0.0.0.0 so other devices on the LAN can
     /// reach it. Off by default — the server binds 127.0.0.1 only.
@@ -828,6 +840,7 @@ pub struct RecordArgSources {
     pub disable_keyboard_capture: bool,
     pub disable_click_capture: bool,
     pub api_auth: bool,
+    pub no_api_auth: bool,
     pub listen_on_lan: bool,
     pub encrypt_secrets: bool,
     pub disable_snapshot_compaction: bool,
@@ -888,6 +901,7 @@ impl RecordArgSources {
             disable_keyboard_capture: from_command_line(record, "disable_keyboard_capture"),
             disable_click_capture: from_command_line(record, "disable_click_capture"),
             api_auth: from_command_line(record, "api_auth"),
+            no_api_auth: from_command_line(record, "no_api_auth"),
             listen_on_lan: from_command_line(record, "listen_on_lan"),
             encrypt_secrets: from_command_line(record, "encrypt_secrets"),
             disable_snapshot_compaction: from_command_line(record, "disable_snapshot_compaction"),
@@ -937,6 +951,7 @@ impl RecordArgSources {
             || self.disable_keyboard_capture
             || self.disable_click_capture
             || self.api_auth
+            || self.no_api_auth
             || self.listen_on_lan
             || self.encrypt_secrets
             || self.disable_snapshot_compaction
@@ -1125,6 +1140,7 @@ impl RecordArgs {
             disable_clipboard_capture: self.disable_clipboard_capture,
             disable_keyboard_capture: self.disable_keyboard_capture,
             disable_click_capture: self.disable_click_capture,
+            api_auth: self.api_auth && !self.no_api_auth,
             listen_on_lan: self.listen_on_lan,
             // Passing any `--schedule-rule` implies the schedule is on.
             schedule_enabled: self.schedule_enabled || !self.schedule_rules.is_empty(),
@@ -1248,10 +1264,10 @@ impl RecordArgs {
         // the API is bound to the LAN — that would publish an unauthenticated
         // service. `from_settings` already enforces this; we reapply it
         // here so a `--no-api-auth --listen-on-lan` combo still authenticates.
-        config.api_auth = self.api_auth || self.listen_on_lan;
-        if self.listen_on_lan && !self.api_auth {
+        config.api_auth = settings.api_auth || self.listen_on_lan;
+        if self.listen_on_lan && !settings.api_auth {
             tracing::warn!(
-                "--listen-on-lan was set but --api-auth=false — forcing api_auth on for safety. Use `screenpipe auth token` to view your key."
+                "--listen-on-lan was set but authentication was disabled — forcing api_auth on for safety. Use `screenpipe auth token` to view your key."
             );
         }
         if config.api_auth {
@@ -1444,6 +1460,9 @@ impl RecordArgs {
         }
         if sources.api_auth {
             settings.api_auth = self.api_auth;
+        }
+        if sources.no_api_auth {
+            settings.api_auth = false;
         }
         if sources.listen_on_lan {
             settings.listen_on_lan = self.listen_on_lan;
@@ -2448,6 +2467,7 @@ mod tests {
         assert!(!sources.disable_audio);
         assert!(!sources.use_pii_removal);
         assert!(!sources.audio_transcription_engine);
+        assert!(!sources.no_api_auth);
     }
 
     #[test]
@@ -2475,6 +2495,45 @@ mod tests {
         assert!(
             !settings.use_pii_removal,
             "absent CLI defaults must not overwrite app settings"
+        );
+    }
+
+    #[test]
+    fn test_no_api_auth_flag_flows_to_recording_settings() {
+        let cli = Cli::try_parse_from(["screenpipe", "record", "--no-api-auth"]).unwrap();
+
+        match cli.command {
+            Command::Record(args) => {
+                let settings = args.to_recording_settings();
+                assert!(
+                    !settings.api_auth,
+                    "--no-api-auth should disable auth in recording settings"
+                );
+            }
+            _ => panic!("expected Record command"),
+        }
+    }
+
+    #[test]
+    fn test_no_api_auth_flag_sets_fresh_recording_settings_false() {
+        let args = ["screenpipe", "record", "--no-api-auth"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        let sources = record_sources(args);
+        let mut settings = screenpipe_config::RecordingSettings {
+            api_auth: true,
+            ..Default::default()
+        };
+
+        match cli.command {
+            Command::Record(args) => {
+                args.apply_explicit_overrides(&mut settings, &sources);
+            }
+            _ => panic!("expected Record command"),
+        }
+
+        assert!(
+            !settings.api_auth,
+            "--no-api-auth should clear persisted auth requirements"
         );
     }
 

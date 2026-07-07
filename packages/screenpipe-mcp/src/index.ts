@@ -78,8 +78,8 @@ const SCREENPIPE_API = (
 //      paths because it reimplements logic that lives in `auth_key.rs` and
 //      can silently drift on storage-format changes.
 //
-// If all 5 miss we log a loud stderr warning so it surfaces in the host's
-// MCP log instead of the user just seeing 403s with no explanation.
+// If all 5 miss we continue without a key so loopback no-auth deployments can
+// still query a local screenpipe started with `--no-api-auth`.
 async function discoverApiKey(): Promise<string> {
   const envKey = process.env.SCREENPIPE_LOCAL_API_KEY || process.env.SCREENPIPE_API_KEY;
   if (envKey) return envKey;
@@ -253,29 +253,8 @@ async function discoverApiKey(): Promise<string> {
     }
   } catch {}
 
-  // All five paths missed. Log loudly to stderr so the host's MCP
-  // panel surfaces this instead of the user seeing cryptic 403s from
-  // the screenpipe server on every tool call.
-  process.stderr.write(
-    [
-      "[screenpipe-mcp] could not discover SCREENPIPE_LOCAL_API_KEY from any source.",
-      "  - env vars (SCREENPIPE_LOCAL_API_KEY / SCREENPIPE_API_KEY) not set",
-      "  - bundled `bun` from screenpipe.app not found at any known install path",
-      "  - npx fallback unavailable",
-      "  - direct sqlite3 read of ~/.screenpipe/db.sqlite failed",
-      "Fix: set SCREENPIPE_LOCAL_API_KEY in your MCP launcher's env block,",
-      "or install the screenpipe desktop app (https://screenpi.pe).",
-      "",
-    ].join("\n"),
-  );
-  // This is a user-side misconfiguration (no key set + no desktop app / CLI /
-  // local DB), not a screenpipe defect — the stderr hint above tells the user
-  // how to fix it. Log it as `info` for activation signal, and throttle to one
-  // event per machine per day so a respawning MCP host can't escalate it.
-  captureMcpMessage("api key discovery failed", "info", {
-    phase: "api_key_discovery",
-    throttleKey: "api_key_discovery",
-  });
+  // An empty key is valid for a loopback server started with `--no-api-auth`.
+  // Authenticated servers will return 403, which callAPI surfaces to the caller.
   return "";
 }
 
