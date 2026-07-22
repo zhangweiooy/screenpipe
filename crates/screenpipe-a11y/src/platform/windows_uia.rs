@@ -7,6 +7,7 @@
 //! of the focused window with minimal CPU via CacheRequest batching and
 //! event-driven capture.
 
+use super::windows_app_identity::WindowsAppIdentity;
 use crate::config::UiCaptureConfig;
 use crate::events::{AccessibilityNode, ElementBounds, ElementContext, WindowTreeSnapshot};
 use crate::tree::TruncationReason;
@@ -1068,8 +1069,8 @@ fn refresh_focused_element(
         return;
     }
 
-    let (app_name, window_title, _pid) = get_window_info(hwnd);
-    if !config.should_capture_target(&app_name, window_title.as_deref()) {
+    let (app_identity, window_title, _pid) = get_window_info(hwnd);
+    if !should_capture_app_identity(config, &app_identity, window_title.as_deref()) {
         return;
     }
 
@@ -1123,11 +1124,12 @@ fn capture_and_send(
     *last_capture_time = capture_start;
 
     // Get window info
-    let (app_name, window_title, pid) = get_window_info(hwnd);
+    let (app_identity, window_title, pid) = get_window_info(hwnd);
+    let app_name = app_identity.display_name.as_str();
 
     // Check exclusions before making UIA tree calls. Some apps expose slow or
     // buggy providers, so the guard needs to happen before ElementFromHandle.
-    if !config.should_capture_target(&app_name, window_title.as_deref()) {
+    if !should_capture_app_identity(config, &app_identity, window_title.as_deref()) {
         return;
     }
 
@@ -1135,7 +1137,7 @@ fn capture_and_send(
     // own host process when we materialize the tree (e.g. Outlook Classic on Sent
     // Items — see is_fragile_uia_tree_provider). Other event capture and OCR are
     // unaffected, so we lose only the a11y tree for these apps, not the crash.
-    if is_fragile_uia_tree_provider(&app_name) {
+    if is_fragile_uia_tree_provider(&app_identity.raw_name) {
         trace!(
             "Skipping a11y tree capture for fragile UIA provider '{}' (crash-prone)",
             app_name
@@ -1190,7 +1192,7 @@ fn capture_and_send(
 
     let snapshot = WindowTreeSnapshot {
         timestamp: Utc::now(),
-        app_name: app_name.clone(),
+        app_name: app_identity.display_name.clone(),
         window_title: window_title.clone(),
         pid,
         root,
@@ -1230,8 +1232,19 @@ fn hash_node(node: &AccessibilityNode, hasher: &mut DefaultHasher) {
     }
 }
 
-/// Get window info (app name, title, pid) from HWND
-fn get_window_info(hwnd: HWND) -> (String, Option<String>, u32) {
+fn should_capture_app_identity(
+    config: &UiCaptureConfig,
+    app_identity: &WindowsAppIdentity,
+    window_title: Option<&str>,
+) -> bool {
+    config.should_capture_target_aliases(
+        &[&app_identity.display_name, &app_identity.raw_name],
+        window_title,
+    )
+}
+
+/// Get window info (product-level app identity, title, pid) from HWND.
+fn get_window_info(hwnd: HWND) -> (WindowsAppIdentity, Option<String>, u32) {
     unsafe {
         let mut title_buf = [0u16; 512];
         let len = GetWindowTextW(hwnd, &mut title_buf);
@@ -1244,10 +1257,9 @@ fn get_window_info(hwnd: HWND) -> (String, Option<String>, u32) {
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
 
-        let app_name =
-            super::windows::get_process_name(pid).unwrap_or_else(|| "Unknown".to_string());
+        let app_identity = super::windows::get_effective_app_identity(hwnd, pid);
 
-        (app_name, title, pid)
+        (app_identity, title, pid)
     }
 }
 
@@ -1349,6 +1361,30 @@ mod tests {
         assert!(!is_fragile_uia_tree_provider("chrome.exe"));
         assert!(!is_fragile_uia_tree_provider("notepad.exe"));
         assert!(!is_fragile_uia_tree_provider(""));
+    }
+
+    #[test]
+    fn test_uia_identity_uses_product_and_process_aliases_for_filters() {
+        let identity = WindowsAppIdentity {
+            raw_name: "chrome.exe".to_string(),
+            display_name: "Google Chrome".to_string(),
+        };
+
+        let mut ignore_product = UiCaptureConfig::new();
+        ignore_product.ignored_windows = vec!["Google Chrome".to_string()];
+        assert!(!should_capture_app_identity(
+            &ignore_product,
+            &identity,
+            Some("Documentation")
+        ));
+
+        let mut ignore_process = UiCaptureConfig::new();
+        ignore_process.ignored_windows = vec!["chrome.exe".to_string()];
+        assert!(!should_capture_app_identity(
+            &ignore_process,
+            &identity,
+            Some("Documentation")
+        ));
     }
 
     #[test]

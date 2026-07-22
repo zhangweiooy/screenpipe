@@ -370,27 +370,67 @@ impl UiCaptureConfig {
 
     /// Check a concrete app/window pair against all capture filters.
     pub fn should_capture_target(&self, app_name: &str, window_title: Option<&str>) -> bool {
-        if !self.should_capture_app(app_name) {
+        self.should_capture_target_aliases(&[app_name], window_title)
+    }
+
+    /// Check a concrete app/window pair using equivalent application names.
+    ///
+    /// Windows capture supplies both the product-level display name and the
+    /// executable name. An ignore match on either alias blocks capture, while
+    /// an include match on either alias is sufficient.
+    pub fn should_capture_target_aliases(
+        &self,
+        app_names: &[&str],
+        window_title: Option<&str>,
+    ) -> bool {
+        if !self.enabled {
             return false;
         }
 
-        if let Some(title) = window_title {
-            if !self.should_capture_window(title) {
+        let fallback_alias = [""];
+        let app_names = if app_names.is_empty() {
+            &fallback_alias[..]
+        } else {
+            app_names
+        };
+        let app_names_lower = app_names
+            .iter()
+            .map(|app_name| app_name.to_lowercase())
+            .collect::<Vec<_>>();
+        let excluded_apps = self.resolved_excluded_apps();
+        if app_names_lower.iter().any(|app_name| {
+            excluded_apps
+                .iter()
+                .any(|excluded| app_name.contains(excluded))
+        }) {
+            return false;
+        }
+
+        let title_lower = window_title.unwrap_or_default().to_lowercase();
+        if let Some(window_title) = window_title {
+            if self
+                .excluded_window_patterns
+                .iter()
+                .any(|pattern| pattern.is_match(window_title))
+            {
                 return false;
             }
         }
 
-        let app_lower = app_name.to_lowercase();
-        let title_lower = window_title.unwrap_or_default().to_lowercase();
-
-        // Scoped ignore patterns (e.g. `Slack::#general`) are evaluated here —
-        // they require both app and title context, which is only present at
-        // this layer.
-        if window_pattern::matches_any(&self.resolved_ignored(), &app_lower, &title_lower) {
+        let ignored = self.resolved_ignored();
+        if app_names_lower
+            .iter()
+            .any(|app_name| window_pattern::matches_any(&ignored, app_name, &title_lower))
+        {
             return false;
         }
 
-        window_pattern::passes_includes(&self.resolved_included(), &app_lower, &title_lower)
+        let included = self.resolved_included();
+        let app_names = app_names_lower
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        window_pattern::passes_includes_aliases(&included, &app_names, &title_lower)
     }
 
     /// Check if element appears to be a password field
@@ -523,6 +563,41 @@ mod tests {
         assert!(config.should_capture_target("Chrome", Some("Docs")));
         assert!(config.should_capture_target("Terminal", Some("ScreenPipe logs")));
         assert!(!config.should_capture_target("Slack", Some("DM")));
+    }
+
+    #[test]
+    fn test_target_aliases_allow_product_or_executable_include() {
+        let mut config = UiCaptureConfig::new();
+        config.included_windows = vec!["Google Chrome".to_string()];
+
+        assert!(config.should_capture_target_aliases(
+            &["Google Chrome", "chrome.exe"],
+            Some("Documentation")
+        ));
+    }
+
+    #[test]
+    fn test_target_aliases_reject_if_any_alias_is_ignored() {
+        let mut config = UiCaptureConfig::new();
+        config.ignored_windows = vec!["chrome.exe".to_string()];
+
+        assert!(!config.should_capture_target_aliases(
+            &["Google Chrome", "chrome.exe"],
+            Some("Documentation")
+        ));
+    }
+
+    #[test]
+    fn test_target_aliases_preserve_scoped_include_whitelist() {
+        let mut config = UiCaptureConfig::new();
+        config.included_windows = vec!["Google Chrome::Documentation".to_string()];
+
+        assert!(!config
+            .should_capture_target_aliases(&["Google Chrome", "chrome.exe"], Some("Settings")));
+        assert!(config.should_capture_target_aliases(
+            &["Google Chrome", "chrome.exe"],
+            Some("Documentation")
+        ));
     }
 
     #[test]

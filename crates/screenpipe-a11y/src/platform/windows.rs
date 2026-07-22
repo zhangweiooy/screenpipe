@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
+use super::windows_app_identity::{resolve_windows_app_identity, WindowsAppIdentity};
 use super::windows_uia::{self, ClickElementRequest};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -223,7 +224,7 @@ impl UiRecorder {
         let mut threads = Vec::new();
 
         // Shared state for current app/window between threads
-        let current_app = Arc::new(Mutex::new(None::<String>));
+        let current_app = Arc::new(Mutex::new(None::<WindowsAppIdentity>));
         let current_window = Arc::new(Mutex::new(None::<String>));
 
         // Shared state for UIA thread
@@ -991,7 +992,7 @@ struct InputWorker {
     tx: Sender<UiEvent>,
     start: Instant,
     config: UiCaptureConfig,
-    current_app: Arc<Mutex<Option<String>>>,
+    current_app: Arc<Mutex<Option<WindowsAppIdentity>>>,
     current_window: Arc<Mutex<Option<String>>>,
     click_queue: Arc<Mutex<Vec<ClickElementRequest>>>,
     focused_element: Arc<Mutex<Option<ElementContext>>>,
@@ -1006,11 +1007,25 @@ struct InputWorker {
 impl InputWorker {
     /// Blocking locks are fine here — the app observer holds these only briefly
     /// and this thread does not gate input dispatch.
-    fn resolve_app_window(&self) -> (Option<String>, Option<String>) {
+    fn resolve_app_window(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let identity = self.current_app.lock().clone();
         (
-            self.current_app.lock().clone(),
+            identity.as_ref().map(|app| app.display_name.clone()),
+            identity.as_ref().map(|app| app.raw_name.clone()),
             self.current_window.lock().clone(),
         )
+    }
+
+    fn should_capture_target(
+        &self,
+        app_name: Option<&str>,
+        raw_app_name: Option<&str>,
+        window_title: Option<&str>,
+    ) -> bool {
+        let app_name = app_name.unwrap_or_default();
+        let raw_app_name = raw_app_name.unwrap_or(app_name);
+        self.config
+            .should_capture_target_aliases(&[app_name, raw_app_name], window_title)
     }
 
     fn emit_key_event(
@@ -1049,9 +1064,10 @@ impl InputWorker {
                 timestamp,
                 relative_ms,
             } => {
-                let (app_name, window_title) = self.resolve_app_window();
-                if !self.config.should_capture_target(
-                    app_name.as_deref().unwrap_or_default(),
+                let (app_name, raw_app_name, window_title) = self.resolve_app_window();
+                if !self.should_capture_target(
+                    app_name.as_deref(),
+                    raw_app_name.as_deref(),
                     window_title.as_deref(),
                 ) {
                     return;
@@ -1133,9 +1149,10 @@ impl InputWorker {
                 timestamp,
                 relative_ms,
             } => {
-                let (app_name, window_title) = self.resolve_app_window();
-                if !self.config.should_capture_target(
-                    app_name.as_deref().unwrap_or_default(),
+                let (app_name, raw_app_name, window_title) = self.resolve_app_window();
+                if !self.should_capture_target(
+                    app_name.as_deref(),
+                    raw_app_name.as_deref(),
                     window_title.as_deref(),
                 ) {
                     return;
@@ -1182,9 +1199,10 @@ impl InputWorker {
                 if !self.config.capture_scroll {
                     return;
                 }
-                let (app_name, window_title) = self.resolve_app_window();
-                if !self.config.should_capture_target(
-                    app_name.as_deref().unwrap_or_default(),
+                let (app_name, raw_app_name, window_title) = self.resolve_app_window();
+                if !self.should_capture_target(
+                    app_name.as_deref(),
+                    raw_app_name.as_deref(),
                     window_title.as_deref(),
                 ) {
                     return;
@@ -1230,9 +1248,10 @@ impl InputWorker {
                 if !self.config.capture_mouse_move {
                     return;
                 }
-                let (app_name, window_title) = self.resolve_app_window();
-                if !self.config.should_capture_target(
-                    app_name.as_deref().unwrap_or_default(),
+                let (app_name, raw_app_name, window_title) = self.resolve_app_window();
+                if !self.should_capture_target(
+                    app_name.as_deref(),
+                    raw_app_name.as_deref(),
                     window_title.as_deref(),
                 ) {
                     return;
@@ -1404,7 +1423,7 @@ fn run_input_worker(
     stop: Arc<AtomicBool>,
     start: Instant,
     config: UiCaptureConfig,
-    current_app: Arc<Mutex<Option<String>>>,
+    current_app: Arc<Mutex<Option<WindowsAppIdentity>>>,
     current_window: Arc<Mutex<Option<String>>>,
     click_queue: Arc<Mutex<Vec<ClickElementRequest>>>,
     focused_element: Arc<Mutex<Option<ElementContext>>>,
@@ -1788,7 +1807,7 @@ struct AppObserverState {
     tx: Sender<UiEvent>,
     start: Instant,
     config: UiCaptureConfig,
-    current_app: Arc<Mutex<Option<String>>>,
+    current_app: Arc<Mutex<Option<WindowsAppIdentity>>>,
     current_window: Arc<Mutex<Option<String>>>,
     focused_element: Arc<Mutex<Option<ElementContext>>>,
     last_hwnd: isize,
@@ -1833,20 +1852,27 @@ fn process_foreground_change(state: &mut AppObserverState) {
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
 
-        // Resolve the logical app name (handles WebView2 and shell-hosted Edge).
-        let app_name = get_effective_app_name(hwnd, pid);
+        // Resolve one product-level app identity for event attribution and filters.
+        let app_identity = get_effective_app_identity(hwnd, pid);
+        let app_name = app_identity.display_name.clone();
 
         // Update shared state before exclusions so input hooks do not keep
         // attributing keystrokes/clicks to the previously focused app.
-        *state.current_app.lock() = Some(app_name.clone());
+        *state.current_app.lock() = Some(app_identity.clone());
         *state.current_window.lock() = title.clone();
 
         // Check exclusions
         if !state
             .config
-            .should_capture_target(&app_name, title.as_deref())
+            .should_capture_target_aliases(&[&app_name, &app_identity.raw_name], title.as_deref())
         {
-            debug!(app = %app_name, pid, title = ?title, "a11y: foreground change excluded");
+            debug!(
+                app = %app_name,
+                raw_app = %app_identity.raw_name,
+                pid,
+                title = ?title,
+                "a11y: foreground change excluded"
+            );
             *state.focused_element.lock() = None;
             state.last_hwnd = hwnd_val;
             state.last_title = title;
@@ -1922,7 +1948,7 @@ fn run_app_observer(
     stop: Arc<AtomicBool>,
     start: Instant,
     config: UiCaptureConfig,
-    current_app: Arc<Mutex<Option<String>>>,
+    current_app: Arc<Mutex<Option<WindowsAppIdentity>>>,
     current_window: Arc<Mutex<Option<String>>>,
     focused_element: Arc<Mutex<Option<ElementContext>>>,
 ) {
@@ -2109,8 +2135,25 @@ pub(crate) fn normalize_app_name(raw_process: &str, window_class: &str) -> Strin
     raw_process.to_string()
 }
 
-/// Resolve the logical application name for a window, accounting for two Windows-specific
-/// attribution quirks that cause Edge content to appear under a different process name:
+fn normalize_app_display_name(identity: &WindowsAppIdentity, window_class: &str) -> String {
+    let normalized_process = normalize_app_name(&identity.raw_name, window_class);
+    if normalized_process.eq_ignore_ascii_case(&identity.raw_name) {
+        return identity.display_name.clone();
+    }
+
+    if normalized_process.eq_ignore_ascii_case("msedge.exe") {
+        return "Microsoft Edge".to_string();
+    }
+
+    normalized_process
+        .strip_suffix(".exe")
+        .unwrap_or(&normalized_process)
+        .to_string()
+}
+
+/// Resolve the product-level application identity for a window, accounting for two
+/// Windows-specific attribution quirks that cause Edge content to appear under a
+/// different process name:
 ///
 /// 1. **msedgewebview2.exe** — Edge's WebView2 runtime sub-process. Normalised to
 ///    `msedge.exe` so that a user exclusion for Edge covers all Edge-spawned windows.
@@ -2122,8 +2165,9 @@ pub(crate) fn normalize_app_name(raw_process: &str, window_class: &str) -> Strin
 ///    host app runs elevated. `GetWindowThreadProcessId` then returns explorer's PID,
 ///    so `get_process_name` yields `"explorer.exe"`. Checking the window class
 ///    (`Chrome_WidgetWin_1`) lets us detect this and return `"msedge.exe"` instead,
-///    so user exclusions for Edge correctly suppress these windows.
-pub(crate) fn get_effective_app_name(hwnd: HWND, pid: u32) -> String {
+///    so user exclusions for Edge correctly suppress these windows. Ordinary apps use
+///    their executable version-resource ProductName/FileDescription.
+pub(crate) fn get_effective_app_identity(hwnd: HWND, pid: u32) -> WindowsAppIdentity {
     let raw = get_process_name(pid).unwrap_or_else(|| "Unknown".to_string());
     let window_class = unsafe {
         let mut buf = [0u16; 128];
@@ -2135,17 +2179,26 @@ pub(crate) fn get_effective_app_name(hwnd: HWND, pid: u32) -> String {
         }
     };
 
-    let effective = normalize_app_name(&raw, &window_class);
-    if effective != raw {
+    let mut identity = resolve_windows_app_identity(pid, &raw);
+    let normalized_process = normalize_app_name(&identity.raw_name, &window_class);
+    let display_name = normalize_app_display_name(&identity, &window_class);
+    if normalized_process != identity.raw_name || display_name != identity.display_name {
         debug!(
             pid,
-            raw_process = %raw,
+            raw_process = %identity.raw_name,
             window_class = %window_class,
-            effective = %effective,
+            effective_process = %normalized_process,
+            display_name = %display_name,
             "a11y: app name normalised"
         );
     }
-    effective
+    identity.raw_name = normalized_process;
+    identity.display_name = display_name;
+    identity
+}
+
+pub(crate) fn get_effective_app_name(hwnd: HWND, pid: u32) -> String {
+    get_effective_app_identity(hwnd, pid).display_name
 }
 
 /// Cheaply resolve the focused window's (app name, window title) without any
@@ -2288,6 +2341,27 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_app_display_name_uses_product_metadata() {
+        let identity = WindowsAppIdentity {
+            raw_name: "Code.exe".to_string(),
+            display_name: "Visual Studio Code".to_string(),
+        };
+        assert_eq!(
+            normalize_app_display_name(&identity, "Chrome_WidgetWin_1"),
+            "Visual Studio Code"
+        );
+    }
+
+    #[test]
+    fn test_normalize_app_display_name_keeps_edge_host_mapping() {
+        let identity = WindowsAppIdentity {
+            raw_name: "msedgewebview2.exe".to_string(),
+            display_name: "Microsoft Edge WebView2".to_string(),
+        };
+        assert_eq!(normalize_app_display_name(&identity, ""), "Microsoft Edge");
+    }
+
+    #[test]
     fn test_vk_to_char() {
         assert_eq!(vk_to_char(0x41, 0, false), Some('a')); // A key, no shift
         assert_eq!(vk_to_char(0x41, 1, false), Some('A')); // A key, with shift
@@ -2311,7 +2385,10 @@ mod tests {
             tx,
             start: std::time::Instant::now(),
             config: crate::config::UiCaptureConfig::default(),
-            current_app: Arc::new(parking_lot::Mutex::new(Some("test".into()))),
+            current_app: Arc::new(parking_lot::Mutex::new(Some(WindowsAppIdentity {
+                raw_name: "test.exe".into(),
+                display_name: "test".into(),
+            }))),
             current_window: Arc::new(parking_lot::Mutex::new(Some("test window".into()))),
             click_queue: Arc::new(parking_lot::Mutex::new(Vec::new())),
             focused_element: Arc::new(parking_lot::Mutex::new(None)),
@@ -2393,11 +2470,43 @@ mod tests {
     fn test_keydown_in_excluded_app_is_dropped() {
         let (tx, rx) = crossbeam_channel::bounded(64);
         let mut worker = make_test_worker(tx, "");
-        *worker.current_app.lock() = Some("1Password".into());
+        *worker.current_app.lock() = Some(WindowsAppIdentity {
+            raw_name: "1Password.exe".into(),
+            display_name: "1Password".into(),
+        });
 
         worker.process_raw(key_down(0x48, 0));
         assert!(worker.text_buf.is_empty());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_keydown_filters_against_raw_process_alias() {
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        let mut worker = make_test_worker(tx, "");
+        worker.config.ignored_windows = vec!["chrome.exe".into()];
+        *worker.current_app.lock() = Some(WindowsAppIdentity {
+            raw_name: "chrome.exe".into(),
+            display_name: "Google Chrome".into(),
+        });
+
+        worker.process_raw(key_down(0x48, 0));
+        assert!(worker.text_buf.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_keydown_accepts_product_name_include_alias() {
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let mut worker = make_test_worker(tx, "");
+        worker.config.included_windows = vec!["Google Chrome".into()];
+        *worker.current_app.lock() = Some(WindowsAppIdentity {
+            raw_name: "chrome.exe".into(),
+            display_name: "Google Chrome".into(),
+        });
+
+        worker.process_raw(key_down(0x48, 0));
+        assert_eq!(worker.text_buf, "h");
     }
 
     #[test]

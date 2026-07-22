@@ -116,6 +116,20 @@ pub fn matches_any(patterns: &[WindowPattern], app_lc: &str, title_lc: &str) -> 
 /// * If a list contains only scoped patterns and none target this app, the
 ///   app passes (the user didn't restrict it).
 pub fn passes_includes(patterns: &[WindowPattern], app_lc: &str, title_lc: &str) -> bool {
+    passes_includes_aliases(patterns, &[app_lc], title_lc)
+}
+
+/// Decide whether equivalent application aliases pass an include list.
+///
+/// Scoped rules treat every alias as the same application. This is important
+/// when a platform exposes both a product name and an executable name: a rule
+/// such as `Google Chrome::Docs` must not be bypassed because `chrome.exe`
+/// looks like an unrelated app.
+pub fn passes_includes_aliases(
+    patterns: &[WindowPattern],
+    app_aliases_lc: &[&str],
+    title_lc: &str,
+) -> bool {
     if patterns.is_empty() {
         return true;
     }
@@ -130,7 +144,10 @@ pub fn passes_includes(patterns: &[WindowPattern], app_lc: &str, title_lc: &str)
     for p in patterns {
         match &p.app {
             Some(app_constraint) => {
-                if app_lc.contains(app_constraint.as_str()) {
+                if app_aliases_lc
+                    .iter()
+                    .any(|app| app.contains(app_constraint.as_str()))
+                {
                     has_app_scoped = true;
                     if !app_scoped_matched
                         && (p.title.is_empty() || title_lc.contains(p.title.as_str()))
@@ -142,7 +159,10 @@ pub fn passes_includes(patterns: &[WindowPattern], app_lc: &str, title_lc: &str)
             None => {
                 has_global = true;
                 if !global_matched
-                    && (app_lc.contains(p.title.as_str()) || title_lc.contains(p.title.as_str()))
+                    && (app_aliases_lc
+                        .iter()
+                        .any(|app| app.contains(p.title.as_str()))
+                        || title_lc.contains(p.title.as_str()))
                 {
                     global_matched = true;
                 }
@@ -313,6 +333,15 @@ mod tests {
         // Other apps pass — they're not restricted by any rule.
         assert!(passes_includes(&patterns, "chrome", "anything"));
         assert!(passes_includes(&patterns, "vscode", "main.rs"));
+    }
+
+    #[test]
+    fn includes_scoped_aliases_are_one_application() {
+        let patterns = WindowPattern::parse_list(&["Google Chrome::Docs".to_string()]);
+        let aliases = ["google chrome", "chrome.exe"];
+
+        assert!(passes_includes_aliases(&patterns, &aliases, "docs"));
+        assert!(!passes_includes_aliases(&patterns, &aliases, "settings"));
     }
 
     #[test]
