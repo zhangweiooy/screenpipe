@@ -19,7 +19,6 @@ use screenpipe_audio::core::device::{
 use screenpipe_audio::{
     core::device::resolve_audio_devices_for_capture, meeting_detector::MeetingDetector,
 };
-use screenpipe_core::agents::AgentExecutor;
 use screenpipe_core::find_ffmpeg_path;
 use screenpipe_core::paths;
 use screenpipe_db::DatabaseManager;
@@ -1532,13 +1531,6 @@ async fn main() -> anyhow::Result<()> {
         .with_pipe_manager(shared_pipe_manager.clone())
         .with_mcp_session_access(mcp_session_access)
         .with_high_fps_controller(high_fps_controller.clone());
-
-    // Install pi agent in background
-    tokio::spawn(async move {
-        if let Err(e) = pi_executor.ensure_installed().await {
-            tracing::warn!("pi agent install failed: {}", e);
-        }
-    });
 
     // print screenpipe in gradient
     println!("\n\n{}", DISPLAY.truecolor(147, 112, 219).bold());
